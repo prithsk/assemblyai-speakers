@@ -13,7 +13,7 @@ after the best one-to-one mapping between AssemblyAI's labels and Rev's.
 
   python bench.py --limit 10        # needs ASSEMBLYAI_API_KEY in .env
 """
-import argparse, collections, csv, difflib, io, json, re, time, datetime as dt
+import argparse, collections, csv, difflib, io, json, re, statistics, time, datetime as dt
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -104,6 +104,19 @@ def wder(pairs):
     right = sum(-cost[i][j] for i, j in zip(rows, cols))
     return 1 - right / len(pairs)
 
+def wder_split(pairs, ref, brief_words=300):
+    from scipy.optimize import linear_sum_assignment
+    if not pairs: return float("nan"), float("nan"), float("nan")
+    total = collections.Counter(s for _, s in ref)
+    R = sorted({a for a, _ in pairs}); H = sorted({str(b) for _, b in pairs})
+    c = collections.Counter((a, str(b)) for a, b in pairs)
+    rows, cols = linear_sum_assignment([[-c[(a, b)] for b in H] for a in R])
+    mapped = {R[i]: H[j] for i, j in zip(rows, cols)}
+    def err(sel):
+        g = [(a, str(b)) for a, b in pairs if sel(a)]
+        return (sum(mapped.get(a) != b for a, b in g) / len(g)) if g else float("nan")
+    return err(lambda a: True), err(lambda a: total[a] >= brief_words), err(lambda a: total[a] < brief_words)
+
 def main(limit):
     need("ASSEMBLYAI_API_KEY"); CACHE.mkdir(exist_ok=True); rows = []
     for fid, company in files()[:limit]:
@@ -113,9 +126,10 @@ def main(limit):
         runs = {"default": base,
                 "estimated": transcribe(fid, f"estimated{est}", {"speaker_options": {"min_speakers_expected": est, "max_speakers_expected": est + 2}}),
                 "oracle": transcribe(fid, f"oracle{true_n}", {"speakers_expected": true_n})}
-        res = {"file": fid, "company": company, "true": true_n, "estimated": est}
+        res = {"file": fid, "company": company, "true": true_n, "est_count": est}
         for k, t in runs.items():
             pairs = align(ref, t["words"]); res[k] = wder(pairs); res[k + "_n"] = len(pairs)
+            _, res[k + "_frequent"], res[k + "_brief"] = wder_split(pairs, ref)
             res[k + "_labels"] = len({w["speaker"] for w in t["words"] if w["speaker"]})
         rows.append(res)
         print(f"  {company[:24]:24s} true {true_n:2d} | est {est:2d} | WDER default {res['default']:.3f} ({res['default_labels']} labels) "
@@ -125,12 +139,12 @@ def main(limit):
     over = [r for r in rows if r["true"] > 10]
     out = [f"# AssemblyAI diarization on Earnings-21, {dt.date.today()}", "",
            f"{len(rows)} earnings calls, Rev's speaker labels as ground truth. WDER is the share of correctly transcribed words attributed to the wrong speaker; lower is better.", "",
-           "| Setup | WDER, all calls | WDER, calls with more than 10 speakers |", "|---|---|---|"]
+           "| Setup | WDER, all calls | WDER, calls with more than 10 speakers | Error on frequent speakers | Error on brief speakers (under 300 words) |", "|---|---|---|---|---|"]
     for name, k in [("AssemblyAI default", "default"), ("Speaker count read from the transcript, passed as speaker_options", "estimated"), ("True speaker count (ceiling)", "oracle")]:
         sub = (sum(r[k] * r[k + "_n"] for r in over) / sum(r[k + "_n"] for r in over)) if over else float("nan")
-        out.append(f"| {name} | {agg(k):.3f} | {sub:.3f} |")
+        out.append(f"| {name} | {agg(k):.3f} | {sub:.3f} | {statistics.mean(r[k + '_frequent'] for r in rows):.3f} | {statistics.mean(x for x in (r[k + '_brief'] for r in rows) if x == x):.3f} |")
     out += ["", "| Call | Company | True speakers | Read from transcript | Default labels | WDER default | estimated | true count |", "|---|---|---|---|---|---|---|---|"]
-    out += [f"| {r['file']} | {r['company']} | {r['true']} | {r['estimated']} | {r['default_labels']} | {r['default']:.3f} | {r['estimated']:.3f} | {r['oracle']:.3f} |" for r in rows]
+    out += [f"| {r['file']} | {r['company']} | {r['true']} | {r['est_count']} | {r['default_labels']} | {r['default']:.3f} | {r['estimated']:.3f} | {r['oracle']:.3f} |" for r in rows]
     out += ["", "## Honest limits", "",
             "- WDER only scores words both transcripts agree on, so it measures speaker attribution, not transcription accuracy.",
             "- The speaker-count reader is a handful of regex patterns for how earnings-call operators talk. It is domain-specific by design.",
